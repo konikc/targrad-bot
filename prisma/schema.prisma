@@ -1,0 +1,128 @@
+// Prisma schema for TargradCore Telegram bot bridge.
+//
+// ХРАНИЛИЩЕ. На Vercel Hobby + SQLite (через Prisma) работает, но SQLite — это
+// файл, и в serverless-окружении он НЕ персистентный: каждый cold start видит
+// новую ФС. Поэтому для прода на Vercel нужен Vercel Postgres или Vercel KV.
+// В dev (локально и в этом sandbox) — SQLite работает.
+//
+// Для прода: измените datasource на Vercel Postgres:
+//   datasource db {
+//     provider = "postgresql"
+//     url      = env("POSTGRES_URL")
+//   }
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Привязка игрока Minecraft к Telegram-аккаунту.
+/// Один игрок — один Telegram chat_id (уникальность по обоим полям).
+model Link {
+  // UUID игрока Minecraft в каноническом виде: "550e8400-e29b-41d4-a716-446655440000"
+  playerUuid  String  @id
+
+  // Telegram chat_id, куда отправлять 2FA-коды и оповещения.
+  telegramId  BigInt  @unique
+
+  // Ник игрока на момент привязки — для логирования и админ-панели.
+  // Может устареть, если игрок сменил ник; при необходимости обновляем.
+  playerName  String?
+
+  // Unix-время привязки в миллисекундах.
+  linkedAt    BigInt
+
+  @@index([telegramId])
+}
+
+/// Ожидающий код привязки: игрок ввёл /tg link в игре, сервер сгенерировал код
+/// и зарегистрировал его здесь. Когда игрок пришлёт /link <код> боту в Telegram,
+/// код валидируется и создаётся Link.
+model PendingLink {
+  // Сам одноразовый код: 4 символа + дефис + 4 символа, "ABCD-1234".
+  code        String  @id
+
+  // UUID игрока, который запросил привязку.
+  playerUuid  String
+
+  // Ник игрока на момент запроса (для подтверждения в Telegram).
+  playerName  String?
+
+  // Unix-время создания в миллисекундах. Коды старше expiryMinutes удаляются.
+  createdAt   BigInt
+
+  // Unix-время истечения. После этого код недействителен.
+  expiresAt   BigInt
+
+  // Статус: pending / confirmed / expired / revoked.
+  // pending — ждёт /link от игрока.
+  // confirmed — игрок привязал, можно создавать Link (это делает webhook).
+  // expired — время вышло, удаляется фоново.
+  // revoked — игрок запросил новый код, старый аннулирован.
+  status      String  @default("pending")
+
+  @@index([playerUuid])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+/// Очередь исходящих сообщений. TargradCore вызывает /api/internal/send,
+/// мы кладём запись сюда. Отправка идёт в webhook-обработчике или в том же запросе.
+/// На Vercel без фоновой очереди нельзя держать long-running task, поэтому
+/// в простом варианте отправляем синхронно в /api/internal/send.
+/// Эта таблица — для логирования и повтора при сбое Telegram API.
+model OutboundMessage {
+  id          String  @id @default(cuid())
+
+  // Получатель: chat_id в Telegram.
+  telegramId  BigInt
+
+  // Текст сообщения (HTML, как требует Telegram).
+  text        String
+
+  // Статус: queued / sent / failed.
+  status      String  @default("queued")
+
+  // HTTP-статус ответа Telegram API (если был запрос).
+  httpStatus  Int?
+
+  // Тело ошибки от Telegram (если failed).
+  errorBody   String?
+
+  createdAt   BigInt
+  sentAt      BigInt?
+
+  @@index([status])
+  @@index([telegramId])
+}
+
+/// Журнал входящих обновлений от Telegram webhook.
+/// Полезно для отладки и аудита: что бот получал и что отвечал.
+model WebhookEvent {
+  id          String  @id @default(cuid())
+
+  // update_id от Telegram.
+  updateId    BigInt  @unique
+
+  // Сырой JSON обновления (для разбора при отладке).
+  rawPayload  String
+
+  // Краткий тип: message / callback_query / edited_message / ...
+  eventType   String?
+
+  // chat_id отправителя (если есть).
+  fromChatId  BigInt?
+
+  // Текст команды (если есть).
+  commandText String?
+
+  // Unix-время приёма.
+  receivedAt  BigInt
+
+  @@index([fromChatId])
+  @@index([receivedAt])
+}
